@@ -1,0 +1,90 @@
+#!/usr/bin/env ruby
+
+require 'nokogiri'
+require 'open-uri'
+require 'json'
+
+def xdg_data_dir
+  if ENV['XDG_DATA_HOME']
+    ENV['XDG_DATA_HOME']
+  elsif ENV['HOME']
+    "#{ENV['HOME']}/.local/share"
+  else
+    "~/.local/share"
+  end
+end
+
+def load_config
+  File.open("#{xdg_data_dir}/flwatch.json", File::RDWR | File::CREAT, 0644) do |f|
+    f.flock(File::LOCK_EX)
+
+    JSON.parse(f.read)
+  end
+end
+
+def write_config(data)
+  File.open("#{xdg_data_dir}/flwatch.json", File::RDWR | File::CREAT, 0644) do |f|
+    f.flock(File::LOCK_EX)
+
+    f.truncate(0)
+    f.write(data.to_json)
+  end
+end
+
+def get_flight_data(carrier_code, flight_number, flight_date)
+  flight_url = "https://www.flightstats.com/v2/flight-tracker/#{carrier_code}/#{flight_number}?year=#{flight_date.year}&month=#{flight_date.month}&date=#{flight_date.day}"
+
+  script = Nokogiri::HTML(URI.open(flight_url).read).css('script').map(&:content).find { _1.include?("__NEXT_DATA__") }
+
+  next_data = script.match(/__NEXT_DATA__ = (.*?);/)
+  raise "no matching JSON for __NEXT_DATA__" if next_data.nil?
+  
+  flight_data = JSON.parse(next_data[1])
+
+  flight_data
+  
+  {
+    flight_status: flight_data.dig("props", "initialState", "flightTracker", "flight", "status", "status"),
+    description: flight_data.dig("props", "initialState", "flightTracker", "flight", "status", "statusDescription"),
+    departure_airport: flight_data.dig("props", "initialState", "flightTracker", "flight", "departureAirport", "iata"),
+    departure_scheduled: flight_data.dig("props", "initialState", "flightTracker", "flight", "departureAirport", "times", "scheduled", "time24"),
+    departure_actual: flight_data.dig("props", "initialState", "flightTracker", "flight", "departureAirport", "times", "estimatedActual", "time24"),
+    arrival_airport: flight_data.dig("props", "initialState", "flightTracker", "flight", "arrivalAirport", "iata"),
+    arrival_scheduled: flight_data.dig("props", "initialState", "flightTracker", "flight", "arrivalAirport", "times", "scheduled", "time24"),
+    arrival_actual: flight_data.dig("props", "initialState", "flightTracker", "flight", "arrivalAirport", "times", "estimatedActual", "time24"),
+  }
+end
+
+CARRIER_CODE="BA"
+FLIGHT_NUMBER="5291"
+FLIGHT_DATE=Date.parse("2026-02-20")
+
+def check_flight(key)
+  fc = load_config.dig('flights', key)
+  
+  puts JSON.pretty_generate(get_flight_data(fc['carrier_code'], fc['flight_number'], Date.parse(fc['flight_date'])))
+end
+
+def add_flight(key, carrier_code, flight_number, flight_date)
+  # TODO warn if key exists
+  
+  conf = load_config
+
+  conf['flights'][key] = {
+    'carrier_code' => carrier_code,
+    'flight_number' => flight_number,
+    'flight_date' => flight_date,
+  }
+  
+  write_config(conf)
+end
+
+def init
+  # TODO warn if config exists
+  
+  write_config({'flights' => {}})
+end
+
+init
+add_flight('testy', CARRIER_CODE, FLIGHT_NUMBER, FLIGHT_DATE)
+check_flight('testy')
