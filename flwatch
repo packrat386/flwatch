@@ -1,29 +1,46 @@
 #!/usr/bin/env ruby
 
-require 'nokogiri'
-require 'open-uri'
-require 'json'
+require "nokogiri"
+require "open-uri"
+require "json"
+require "optparse"
+require "optparse/date"
 
-def xdg_data_dir
-  if ENV['XDG_DATA_HOME']
-    ENV['XDG_DATA_HOME']
-  elsif ENV['HOME']
-    "#{ENV['HOME']}/.local/share"
+class Object
+  # shamelessly taken from ActiveSupport core ext
+  def blank?
+    respond_to?(:empty?) ? !!empty? : nil?
+  end
+
+  def present?
+    !blank?
+  end
+end
+
+def _flwatch_xdg_data_dir
+  if ENV["XDG_DATA_HOME"]
+    ENV["XDG_DATA_HOME"]
+  elsif ENV["HOME"]
+    "#{ENV["HOME"]}/.local/share"
   else
     "~/.local/share"
   end
 end
 
-def load_config
-  File.open("#{xdg_data_dir}/flwatch.json", File::RDWR | File::CREAT, 0644) do |f|
+def _flwatch_config_file
+  "#{_flwatch_xdg_data_dir}/flwatch.json"
+end
+
+def _flwatch_load_config
+  File.open(_flwatch_config_file, File::RDWR | File::CREAT, 0o644) do |f|
     f.flock(File::LOCK_EX)
 
     JSON.parse(f.read)
   end
 end
 
-def write_config(data)
-  File.open("#{xdg_data_dir}/flwatch.json", File::RDWR | File::CREAT, 0644) do |f|
+def _flwatch_write_config(data)
+  File.open(_flwatch_config_file, File::RDWR | File::CREAT, 0o644) do |f|
     f.flock(File::LOCK_EX)
 
     f.truncate(0)
@@ -31,19 +48,25 @@ def write_config(data)
   end
 end
 
-def get_flight_data(carrier_code, flight_number, flight_date)
-  flight_url = "https://www.flightstats.com/v2/flight-tracker/#{carrier_code}/#{flight_number}?year=#{flight_date.year}&month=#{flight_date.month}&date=#{flight_date.day}"
+def _flwatch_get_flight_data(key, carrier_code, flight_number, flight_date)
+  flight_uri = URI::HTTPS.build(
+    host: "www.flightstats.com",
+    path: "/v2/flight-tracker/#{carrier_code}/#{flight_number}",
+    query: URI.encode_www_form(year: flight_date.year, month: flight_date.month, date: flight_date.day)
+  )
 
-  script = Nokogiri::HTML(URI.open(flight_url).read).css('script').map(&:content).find { _1.include?("__NEXT_DATA__") }
+  script = Nokogiri::HTML(flight_uri.open.read).css("script").map(&:content).find { _1.include?("__NEXT_DATA__") }
 
   next_data = script.match(/__NEXT_DATA__ = (.*?);/)
   raise "no matching JSON for __NEXT_DATA__" if next_data.nil?
-  
+
   flight_data = JSON.parse(next_data[1])
 
-  flight_data
-  
   {
+    key: key,
+    carrier_code: carrier_code,
+    flight_number: flight_number,
+    flight_date: flight_date.to_s,
     flight_status: flight_data.dig("props", "initialState", "flightTracker", "flight", "status", "status"),
     description: flight_data.dig("props", "initialState", "flightTracker", "flight", "status", "statusDescription"),
     departure_airport: flight_data.dig("props", "initialState", "flightTracker", "flight", "departureAirport", "iata"),
@@ -52,39 +75,144 @@ def get_flight_data(carrier_code, flight_number, flight_date)
     arrival_airport: flight_data.dig("props", "initialState", "flightTracker", "flight", "arrivalAirport", "iata"),
     arrival_scheduled: flight_data.dig("props", "initialState", "flightTracker", "flight", "arrivalAirport", "times", "scheduled", "time24"),
     arrival_actual: flight_data.dig("props", "initialState", "flightTracker", "flight", "arrivalAirport", "times", "estimatedActual", "time24"),
+    tracker_url: flight_uri.to_s
   }
 end
 
-CARRIER_CODE="BA"
-FLIGHT_NUMBER="5291"
-FLIGHT_DATE=Date.parse("2026-02-20")
+def flwatch_init(argv)
+  opts = {}
+  OptionParser.new("flwatch init") do |p|
+    p.banner = "Usage: flwatch init"
 
-def check_flight(key)
-  fc = load_config.dig('flights', key)
-  
-  puts JSON.pretty_generate(get_flight_data(fc['carrier_code'], fc['flight_number'], Date.parse(fc['flight_date'])))
+    p.on("--force", "force replacement of the config file") do
+      opts[:force] = true
+    end
+  end.parse!(argv)
+
+  raise "config file #{config_file} already exists" if !opts[:force] && File.exist?(_flwatch_config_file)
+
+  write_config({"flights" => {}})
 end
 
-def add_flight(key, carrier_code, flight_number, flight_date)
-  # TODO warn if key exists
-  
-  conf = load_config
+def flwatch_add(argv)
+  opts = {}
+  OptionParser.new("flwatch add") do |p|
+    p.banner = "Usage: flwatch add -k [KEY] -c [CARRIER_CODE] -n [FLIGHT_NUMBER] -d [DATE]"
 
-  conf['flights'][key] = {
-    'carrier_code' => carrier_code,
-    'flight_number' => flight_number,
-    'flight_date' => flight_date,
+    p.on("-k KEY", "unique key for flight to watch", String) do |v|
+      opts[:key] = v
+    end
+
+    p.on("-c CARRIER_CODE", "airline carrier code", String) do |v|
+      opts[:carrier_code] = v
+    end
+
+    p.on("-n FLIGHT_NUMBER", "flight number", String) do |v|
+      opts[:flight_number] = v
+    end
+
+    p.on("-d DATE", "flight date", Date) do |v|
+      opts[:flight_date] = v
+    end
+
+    p.on("--today", "add a flight with a date of today") do
+      opts[:flight_date] = Date.today
+    end
+
+    p.on("--force", "on key conflict, overwrite") do
+      opts[:force] = true
+    end
+  end.parse!(argv)
+
+  raise "KEY required" if opts[:key].blank?
+  raise "CARRIER_CODE required" if opts[:carrier_code].blank?
+  raise "FLIGHT_NUMBER required" if opts[:flight_number].blank?
+  raise "DATE required" if opts[:flight_date].blank?
+
+  conf = _flwatch_load_config
+
+  conf["flights"][opts[:key]] = {
+    "carrier_code" => opts[:carrier_code],
+    "flight_number" => opts[:flight_number],
+    "flight_date" => opts[:flight_date]
   }
-  
-  write_config(conf)
+
+  _flwatch_write_config(conf)
 end
 
-def init
-  # TODO warn if config exists
-  
-  write_config({'flights' => {}})
+def flwatch_list(argv)
+  OptionParser.new("flwatch list") do |p|
+    p.banner = "Usage: flwatch list"
+  end.parse!(argv)
+
+  _flwatch_load_config["flights"].keys.each { |k| puts k }
 end
 
-init
-add_flight('testy', CARRIER_CODE, FLIGHT_NUMBER, FLIGHT_DATE)
-check_flight('testy')
+def flwatch_check(argv)
+  opts = {}
+  OptionParser.new("flwatch check") do |p|
+    p.banner = "Usage: flwatch check -k [KEY]"
+
+    p.on("-k KEY", "unique key for flight to watch", String) do |v|
+      opts[:key] = v
+    end
+  end.parse!(argv)
+
+  raise "KEY required" if opts[:key].blank?
+
+  _flwatch_load_config.dig("flights", opts[:key]).tap do |fc|
+    puts JSON.pretty_generate(_flwatch_get_flight_data(opts[:key], fc["carrier_code"], fc["flight_number"], Date.parse(fc["flight_date"])))
+  end
+end
+
+def flwatch_delete(argv)
+  opts = {}
+  OptionParser.new("flwatch delete") do |p|
+    p.banner = "Usage: flwatch delete -k [KEY]"
+
+    p.on("-k KEY", "unique key for flight to watch", String) do |v|
+      opts[:key] = v
+    end
+  end.parse!(argv)
+
+  raise "KEY required" if opts[:key].blank?
+
+  conf = _flwatch_load_config
+  conf["flights"].delete(opts[:key])
+  _flwatch_write_config(conf)
+end
+
+def flwatch_help(argv)
+  puts <<~HELP
+    Usage: flwatch [COMMAND] [FLAGS...]
+
+    Commands:
+      i(nit)?    initialize the data file for flwatch
+      a(dd)?     add a flight from the list to watch
+      l(ist)?    print all flights on the list to watch
+      c(heck)?   get the status of a particular flight
+      d(elete)?  delete a flight from the list to watch
+      h(elp)?    display this help message
+
+    to see flags for subcommands run: flwatch [CMD] --help
+  HELP
+end
+
+case cmd = ARGV.shift
+when "i", "init"
+  flwatch_init(ARGV)
+when "a", "add"
+  flwatch_add(ARGV)
+when "l", "list"
+  flwatch_list(ARGV)
+when "c", "check"
+  flwatch_check(ARGV)
+when "d", "delete"
+  flwatch_delete(ARGV)
+when "h", "help"
+  flwatch_help(ARGV)
+else
+  puts "unrecognized command: #{cmd}"
+  flwatch_help(ARGV)
+  exit(1)
+end
